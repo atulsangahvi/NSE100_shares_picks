@@ -1,7 +1,8 @@
-import math
 import time
+import math
+import io
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -10,26 +11,19 @@ import streamlit as st
 import yfinance as yf
 
 
-# -----------------------------
-# Config / Utilities
-# -----------------------------
 st.set_page_config(page_title="NIFTY 100 Technical Scanner", layout="wide")
 
 NSE_INDICES_NIFTY100_CSV = "https://www.niftyindices.com/IndexConstituent/ind_nifty100list.csv"
 
-# Fallback list (not guaranteed always up-to-date)
-# You can edit this list anytime.
+# Fallback list (partial). You can expand it, but we try to fetch live first.
 FALLBACK_NIFTY100 = [
-    "ADANIENT", "ADANIPORTS", "APOLLOHOSP", "ASIANPAINT", "AXISBANK",
-    "BAJAJ-AUTO", "BAJFINANCE", "BAJAJFINSV", "BPCL", "BHARTIARTL",
-    "BRITANNIA", "CIPLA", "COALINDIA", "DIVISLAB", "DRREDDY", "EICHERMOT",
-    "GRASIM", "HCLTECH", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO", "HINDALCO",
-    "HINDUNILVR", "ICICIBANK", "ITC", "INDUSINDBK", "INFY", "JSWSTEEL",
-    "KOTAKBANK", "LT", "M&M", "MARUTI", "NESTLEIND", "NTPC",
-    "ONGC", "POWERGRID", "RELIANCE", "SBIN", "SUNPHARMA",
-    "TATAMOTORS", "TATASTEEL", "TCS", "TECHM", "TITAN", "ULTRACEMCO",
-    "WIPRO",
-    # Add more if you want; live fetch is preferred.
+    "RELIANCE","TCS","HDFCBANK","ICICIBANK","INFY","LT","ITC","SBIN","AXISBANK",
+    "BHARTIARTL","HINDUNILVR","KOTAKBANK","BAJFINANCE","ASIANPAINT","HCLTECH",
+    "SUNPHARMA","TITAN","MARUTI","M&M","TATAMOTORS","WIPRO","ULTRACEMCO","TECHM",
+    "NTPC","ONGC","POWERGRID","COALINDIA","DIVISLAB","DRREDDY","EICHERMOT",
+    "HINDALCO","JSWSTEEL","TATASTEEL","CIPLA","BAJAJFINSV","BAJAJ-AUTO","BPCL",
+    "BRITANNIA","GRASIM","HEROMOTOCO","NESTLEIND","HDFCLIFE","ADANIPORTS","ADANIENT",
+    "APOLLOHOSP",
 ]
 
 
@@ -41,28 +35,23 @@ def safe_float(x, default=np.nan):
 
 
 # -----------------------------
-# Technical Indicators
+# Indicators
 # -----------------------------
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    """Wilder's RSI."""
     delta = series.diff()
     up = delta.clip(lower=0.0)
     down = (-delta).clip(lower=0.0)
-
-    # Wilder's smoothing = EMA with alpha=1/period
-    roll_up = up.ewm(alpha=1 / period, adjust=False).mean()
-    roll_down = down.ewm(alpha=1 / period, adjust=False).mean()
-
+    roll_up = up.ewm(alpha=1/period, adjust=False).mean()
+    roll_down = down.ewm(alpha=1/period, adjust=False).mean()
     rs = roll_up / roll_down.replace(0, np.nan)
-    rsi_ = 100 - (100 / (1 + rs))
-    return rsi_
+    return 100 - (100 / (1 + rs))
 
 
 def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False).mean()
 
 
-def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[pd.Series, pd.Series, pd.Series]:
+def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9):
     macd_line = ema(series, fast) - ema(series, slow)
     signal_line = ema(macd_line, signal)
     hist = macd_line - signal_line
@@ -70,298 +59,328 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> 
 
 
 # -----------------------------
-# Universe fetch
+# Universe
 # -----------------------------
-@st.cache_data(ttl=6 * 60 * 60)
-def fetch_nifty100_symbols() -> List[str]:
+@st.cache_data(ttl=6*60*60)
+def fetch_nifty100_symbols() -> Tuple[List[str], str]:
     """
-    Try to fetch NIFTY 100 constituents from NSE Indices CSV.
-    If it fails, return fallback list.
+    Returns (symbols, source_string)
     """
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "text/csv,application/csv",
-        }
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "text/csv"}
         resp = requests.get(NSE_INDICES_NIFTY100_CSV, headers=headers, timeout=20)
         resp.raise_for_status()
-        df = pd.read_csv(pd.compat.StringIO(resp.text)) if hasattr(pd, "compat") else pd.read_csv(pd.io.common.StringIO(resp.text))  # compatibility
-        # Common column name in that CSV: "Symbol"
+        df = pd.read_csv(io.StringIO(resp.text))
         if "Symbol" in df.columns:
             syms = sorted(df["Symbol"].dropna().astype(str).unique().tolist())
-            return syms
+            if len(syms) >= 80:
+                return syms, "niftyindices.com CSV"
     except Exception:
         pass
 
-    return sorted(list(set(FALLBACK_NIFTY100)))
+    return sorted(list(set(FALLBACK_NIFTY100))), "fallback list"
 
 
 def to_yf_ticker(nse_symbol: str) -> str:
-    """Convert NSE symbol to Yahoo Finance ticker."""
     return f"{nse_symbol}.NS"
 
 
 # -----------------------------
-# Data download
+# Robust downloader
 # -----------------------------
-@st.cache_data(ttl=60 * 60)
-def download_history(tickers: List[str], period: str = "6mo", interval: str = "1d") -> Dict[str, pd.DataFrame]:
-    """
-    Download OHLCV for each ticker using yfinance.
-    Returns dict[ticker] = dataframe with columns: Open, High, Low, Close, Volume
-    """
-    out = {}
-    # yfinance batch download
-    # group_by="ticker" returns MultiIndex columns (ticker, field)
-    data = yf.download(
-        tickers=tickers,
-        period=period,
-        interval=interval,
-        group_by="ticker",
-        auto_adjust=False,
-        threads=True,
-        progress=False,
-    )
+def chunked(lst: List[str], n: int) -> List[List[str]]:
+    return [lst[i:i+n] for i in range(0, len(lst), n)]
 
-    if isinstance(data.columns, pd.MultiIndex):
-        # Multi-ticker result
-        for t in tickers:
-            if t in data.columns.get_level_values(0):
-                df = data[t].dropna(how="all")
-                if not df.empty:
-                    out[t] = df.copy()
-    else:
-        # Single ticker
-        if not data.empty and len(tickers) == 1:
-            out[tickers[0]] = data.dropna(how="all").copy()
 
-    return out
+@st.cache_data(ttl=60*60)
+def download_history_chunked(
+    tickers: List[str],
+    period: str = "6mo",
+    interval: str = "1d",
+    chunk_size: int = 20,
+    max_retries: int = 2,
+    sleep_s: float = 0.8,
+) -> Tuple[Dict[str, pd.DataFrame], List[str]]:
+    """
+    Downloads in chunks to reduce Yahoo failures/rate limits.
+    Returns: (data_map, failed_tickers)
+    """
+    data_map: Dict[str, pd.DataFrame] = {}
+    failed: List[str] = []
+
+    for group in chunked(tickers, chunk_size):
+        ok_this_group = False
+
+        for attempt in range(max_retries + 1):
+            try:
+                raw = yf.download(
+                    tickers=group,
+                    period=period,
+                    interval=interval,
+                    group_by="ticker",
+                    threads=True,
+                    progress=False,
+                    auto_adjust=False,
+                )
+
+                if raw is None or getattr(raw, "empty", True):
+                    raise RuntimeError("Empty response from yfinance")
+
+                # MultiIndex if multiple tickers succeed
+                if isinstance(raw.columns, pd.MultiIndex):
+                    for t in group:
+                        if t in raw.columns.get_level_values(0):
+                            df = raw[t].dropna(how="all")
+                            if df is not None and not df.empty and "Close" in df.columns:
+                                data_map[t] = df
+                    ok_this_group = True
+                else:
+                    # single ticker case
+                    if len(group) == 1 and "Close" in raw.columns and not raw.empty:
+                        data_map[group[0]] = raw.dropna(how="all")
+                        ok_this_group = True
+
+                if ok_this_group:
+                    break
+
+            except Exception:
+                if attempt < max_retries:
+                    time.sleep(sleep_s * (attempt + 1))
+                else:
+                    pass
+
+        # Mark failures for this group (only those not in map)
+        for t in group:
+            if t not in data_map:
+                failed.append(t)
+
+        time.sleep(sleep_s)
+
+    # De-dup
+    failed = sorted(list(set(failed)))
+    return data_map, failed
 
 
 # -----------------------------
-# Scoring model (simple + explainable)
+# Features + scoring
 # -----------------------------
 @dataclass
 class ScanParams:
     rsi_buy_min: float = 35.0
     rsi_buy_max: float = 65.0
-    min_history_bars: int = 120
-    vol_boost: float = 1.2  # volume / 20d avg volume
-    lookback_days_for_breakout: int = 20
+    vol_boost: float = 1.2
+    breakout_lookback: int = 20
 
 
-def compute_features(df: pd.DataFrame) -> Optional[Dict[str, float]]:
-    """
-    Compute last value of key indicators.
-    """
+def compute_features(df: pd.DataFrame, breakout_lookback: int = 20) -> Optional[Dict[str, float]]:
     if df is None or df.empty or "Close" not in df.columns:
         return None
 
-    close = df["Close"].astype(float)
-    vol = df["Volume"].astype(float) if "Volume" in df.columns else pd.Series(index=df.index, data=np.nan)
-
-    if close.dropna().shape[0] < 60:
+    close = df["Close"].astype(float).dropna()
+    if close.shape[0] < 60:
         return None
 
+    vol = df["Volume"].astype(float) if "Volume" in df.columns else pd.Series(index=df.index, data=np.nan)
+
     r = rsi(close, 14)
-    macd_line, sig, hist = macd(close, 12, 26, 9)
+    _, _, hist = macd(close, 12, 26, 9)
     sma20 = close.rolling(20).mean()
     sma50 = close.rolling(50).mean()
-
     vol20 = vol.rolling(20).mean()
 
-    last = df.index.max()
-    # Last valid rows
-    last_close = safe_float(close.loc[last])
-    last_rsi = safe_float(r.loc[last])
-    last_macdh = safe_float(hist.loc[last])
-    last_sma20 = safe_float(sma20.loc[last])
-    last_sma50 = safe_float(sma50.loc[last])
-    last_vol = safe_float(vol.loc[last])
-    last_vol20 = safe_float(vol20.loc[last])
+    last_idx = close.index[-1]
+    last_close = safe_float(close.loc[last_idx])
+    last_rsi = safe_float(r.loc[last_idx])
+    last_hist = safe_float(hist.loc[last_idx])
+    last_sma20 = safe_float(sma20.loc[last_idx])
+    last_sma50 = safe_float(sma50.loc[last_idx])
 
-    # Simple breakout signal: close above max close of last N days (excluding today)
-    n = 20
-    if close.shape[0] > n + 1:
-        prev_window = close.iloc[-(n+1):-1]
-        breakout = 1.0 if last_close > float(prev_window.max()) else 0.0
-    else:
-        breakout = np.nan
+    last_vol = safe_float(vol.loc[last_idx]) if last_idx in vol.index else np.nan
+    last_vol20 = safe_float(vol20.loc[last_idx]) if last_idx in vol20.index else np.nan
+    vol_ratio = (last_vol / last_vol20) if (np.isfinite(last_vol) and np.isfinite(last_vol20) and last_vol20 > 0) else np.nan
+
+    # Breakout (close > max previous N closes)
+    br = np.nan
+    if close.shape[0] > breakout_lookback + 1:
+        prev = close.iloc[-(breakout_lookback + 1):-1]
+        br = 1.0 if last_close > float(prev.max()) else 0.0
 
     return {
         "close": last_close,
         "rsi14": last_rsi,
-        "macd_hist": last_macdh,
+        "macd_hist": last_hist,
         "sma20": last_sma20,
         "sma50": last_sma50,
-        "vol": last_vol,
-        "vol20": last_vol20,
-        "vol_ratio": (last_vol / last_vol20) if (last_vol20 and not math.isnan(last_vol20) and last_vol20 > 0) else np.nan,
-        "breakout20": breakout,
+        "vol_ratio": vol_ratio,
+        "breakout": br,
     }
 
 
 def score_short_term(feat: Dict[str, float], p: ScanParams) -> Tuple[float, List[str]]:
-    """
-    Produce an explainable score. Higher = better.
-    Criteria:
-      + Trend: close > SMA20, SMA20 > SMA50
-      + Momentum: MACD hist > 0
-      + RSI: in a "healthy" band (avoid too overbought/oversold)
-      + Volume: vol ratio > threshold
-      + Breakout: optional bonus
-    """
     reasons = []
     score = 0.0
 
     c = feat["close"]
     r = feat["rsi14"]
-    mh = feat["macd_hist"]
+    h = feat["macd_hist"]
     sma20 = feat["sma20"]
     sma50 = feat["sma50"]
     vr = feat["vol_ratio"]
-    br = feat["breakout20"]
+    br = feat["breakout"]
 
     # Trend
     if np.isfinite(c) and np.isfinite(sma20) and c > sma20:
-        score += 1.0
-        reasons.append("Close > SMA20")
+        score += 1.0; reasons.append("Close > SMA20")
     else:
         reasons.append("Close <= SMA20")
 
     if np.isfinite(sma20) and np.isfinite(sma50) and sma20 > sma50:
-        score += 1.0
-        reasons.append("SMA20 > SMA50")
+        score += 1.0; reasons.append("SMA20 > SMA50")
     else:
         reasons.append("SMA20 <= SMA50")
 
     # Momentum
-    if np.isfinite(mh) and mh > 0:
-        score += 1.0
-        reasons.append("MACD histogram > 0")
+    if np.isfinite(h) and h > 0:
+        score += 1.0; reasons.append("MACD hist > 0")
     else:
-        reasons.append("MACD histogram <= 0")
+        reasons.append("MACD hist <= 0")
 
     # RSI band
-    if np.isfinite(r) and (p.rsi_buy_min <= r <= p.rsi_buy_max):
-        score += 1.0
-        reasons.append(f"RSI in {p.rsi_buy_min:.0f}-{p.rsi_buy_max:.0f}")
+    if np.isfinite(r) and p.rsi_buy_min <= r <= p.rsi_buy_max:
+        score += 1.0; reasons.append(f"RSI in {int(p.rsi_buy_min)}–{int(p.rsi_buy_max)}")
     else:
-        reasons.append("RSI outside preferred band")
+        reasons.append("RSI out of band")
 
-    # Volume confirmation
+    # Volume
     if np.isfinite(vr) and vr >= p.vol_boost:
-        score += 1.0
-        reasons.append(f"Volume spike (>{p.vol_boost:.1f}x 20D avg)")
+        score += 1.0; reasons.append(f"Vol > {p.vol_boost:.1f}×20D")
     else:
-        reasons.append("No strong volume spike")
+        reasons.append("No vol confirmation")
 
     # Breakout bonus
     if np.isfinite(br) and br > 0:
-        score += 0.5
-        reasons.append("20D breakout")
+        score += 0.5; reasons.append("Breakout")
     else:
-        reasons.append("No 20D breakout")
+        reasons.append("No breakout")
 
     return score, reasons
 
 
 # -----------------------------
-# Streamlit UI
+# UI
 # -----------------------------
 st.title("NIFTY 100 Technical Scanner (Short-term)")
 
 with st.sidebar:
-    st.header("Scan settings")
+    st.header("Settings")
     period = st.selectbox("History period", ["3mo", "6mo", "1y", "2y"], index=1)
-    interval = st.selectbox("Interval", ["1d", "1h"], index=0)
-    top_n = st.slider("Show top N", 5, 50, 20)
+    interval = st.selectbox("Interval", ["1d"], index=0)  # keep MVP stable
+    chunk_size = st.slider("Download chunk size", 5, 50, 20)
+    top_n = st.slider("Top N", 5, 50, 20)
 
-    st.subheader("Signal preferences")
+    st.subheader("Signal filters")
     rsi_min = st.slider("RSI min", 10, 60, 35)
     rsi_max = st.slider("RSI max", 40, 90, 65)
     vol_boost = st.slider("Volume boost vs 20D avg", 1.0, 3.0, 1.2, 0.1)
+    breakout_lb = st.slider("Breakout lookback days", 10, 60, 20)
 
-    p = ScanParams(rsi_buy_min=float(rsi_min), rsi_buy_max=float(rsi_max), vol_boost=float(vol_boost))
+    p = ScanParams(
+        rsi_buy_min=float(rsi_min),
+        rsi_buy_max=float(rsi_max),
+        vol_boost=float(vol_boost),
+        breakout_lookback=int(breakout_lb),
+    )
 
-    st.caption("Tip: 1h interval is heavier and may hit rate-limits. Start with 1d.")
-
-symbols = fetch_nifty100_symbols()
+symbols, src = fetch_nifty100_symbols()
 tickers = [to_yf_ticker(s) for s in symbols]
-
-st.write(f"Universe: **NIFTY 100** constituents loaded: **{len(symbols)}**")
+st.write(f"Universe loaded: **{len(symbols)}** symbols (source: **{src}**)")
 
 run = st.button("Run scan", type="primary")
 
 if run:
-    with st.spinner("Downloading data & computing indicators..."):
-        data_map = download_history(tickers, period=period, interval=interval)
+    with st.spinner("Downloading data in chunks (with retries)..."):
+        data_map, failed = download_history_chunked(
+            tickers,
+            period=period,
+            interval=interval,
+            chunk_size=chunk_size,
+            max_retries=2,
+            sleep_s=0.6,
+        )
 
-        rows = []
-        for sym in symbols:
-            t = to_yf_ticker(sym)
-            df = data_map.get(t)
-            if df is None or df.empty:
-                continue
-            if df.shape[0] < p.min_history_bars and interval == "1d":
-                # Not enough history for stable 50/200, etc.
-                # Still allow but you can tighten this if you want.
-                pass
+    st.write(f"Downloaded: **{len(data_map)}** tickers | Failed: **{len(failed)}**")
 
-            feat = compute_features(df)
-            if not feat:
-                continue
+    if len(data_map) == 0:
+        st.error(
+            "Still got zero data from Yahoo Finance. This usually means yfinance is blocked/rate-limited from your environment.\n\n"
+            "Quick fixes:\n"
+            "- Try running locally (works more reliably than Streamlit Cloud for yfinance).\n"
+            "- Or switch to an NSE data source (see note below).\n"
+        )
+        st.stop()
 
-            score, reasons = score_short_term(feat, p)
+    if failed:
+        with st.expander("Show failed tickers"):
+            st.write(failed[:200])
 
-            rows.append({
-                "Symbol": sym,
-                "Score": score,
-                "Close": feat["close"],
-                "RSI14": feat["rsi14"],
-                "MACD_hist": feat["macd_hist"],
-                "SMA20": feat["sma20"],
-                "SMA50": feat["sma50"],
-                "VolRatio": feat["vol_ratio"],
-                "Breakout20": feat["breakout20"],
-                "Why": " | ".join(reasons[:5]),
-            })
+    rows = []
+    for sym in symbols:
+        t = to_yf_ticker(sym)
+        df = data_map.get(t)
+        if df is None or df.empty:
+            continue
 
-        if not rows:
-            st.error("No results. Try 1d interval, larger period, or check connectivity.")
-            st.stop()
+        feat = compute_features(df, breakout_lookback=p.breakout_lookback)
+        if not feat:
+            continue
 
-        res = pd.DataFrame(rows)
-        res = res.sort_values(["Score", "RSI14"], ascending=[False, True]).reset_index(drop=True)
+        score, reasons = score_short_term(feat, p)
 
-    st.subheader("Top candidates (by score)")
+        rows.append({
+            "Symbol": sym,
+            "Score": score,
+            "Close": feat["close"],
+            "RSI14": feat["rsi14"],
+            "MACD_hist": feat["macd_hist"],
+            "SMA20": feat["sma20"],
+            "SMA50": feat["sma50"],
+            "VolRatio": feat["vol_ratio"],
+            "Breakout": feat["breakout"],
+            "Why": " | ".join(reasons[:6]),
+        })
+
+    if not rows:
+        st.error(
+            "Downloaded data, but no symbols passed indicator computation.\n"
+            "Try:\n"
+            "- Increase period to 1y\n"
+            "- Widen RSI band\n"
+            "- Lower volume boost threshold\n"
+        )
+        st.stop()
+
+    res = pd.DataFrame(rows).sort_values(["Score", "RSI14"], ascending=[False, True]).reset_index(drop=True)
+    st.subheader("Top candidates")
     st.dataframe(res.head(top_n), use_container_width=True)
 
-    st.subheader("Quick chart + details")
-    pick = st.selectbox("Select a symbol to inspect", res["Symbol"].head(top_n).tolist())
+    st.subheader("Inspect a symbol")
+    pick = st.selectbox("Symbol", res["Symbol"].head(top_n).tolist())
     t = to_yf_ticker(pick)
     df = data_map.get(t)
 
     if df is not None and not df.empty:
         close = df["Close"].astype(float)
-        r = rsi(close, 14)
-        sma20 = close.rolling(20).mean()
-        sma50 = close.rolling(50).mean()
-        macd_line, sig, hist = macd(close, 12, 26, 9)
-
-        chart_df = pd.DataFrame({
+        chart = pd.DataFrame({
             "Close": close,
-            "SMA20": sma20,
-            "SMA50": sma50,
+            "SMA20": close.rolling(20).mean(),
+            "SMA50": close.rolling(50).mean(),
         }).dropna()
+        st.line_chart(chart)
 
-        st.line_chart(chart_df)
-
-        ind_df = pd.DataFrame({
-            "RSI14": r,
-            "MACD_hist": hist,
+        ind = pd.DataFrame({
+            "RSI14": rsi(close, 14),
+            "MACD_hist": macd(close, 12, 26, 9)[2],
         }).dropna()
+        st.line_chart(ind)
 
-        st.line_chart(ind_df)
-
-        st.caption("Reminder: This is a technical filter, not a guarantee. Use risk controls (stop-loss, position sizing).")
+    st.caption("This is a technical filter, not a guarantee. Use position sizing + stop discipline.")
